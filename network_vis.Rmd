@@ -1,0 +1,341 @@
+---
+title: "Network_vis"
+author: "Cory DuPai"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+# {.tabset}
+## Getting started
+We first need to load the packages we'll use and set up a theme for our plots. The main workhorse for our networks will be tidygraph and ggraph. As this is a basic primer, you can find more info on these packages here:
+
+- https://www.data-imaginist.com/2017/introducing-tidygraph/
+- https://github.com/thomasp85/ggraph
+
+```{r libraries_and_settings, echo = TRUE}
+library(tidyverse) # For data manipulation/graphing
+library(tidygraph) # Represent network data in tabular format
+library(cowplot) # Make ggplot prettier
+library(ggraph) # Graph networks
+
+theme_set(theme_cowplot(12)) # Minimalist theme
+
+# Colorblind friendly palette
+cbPalette <- c("#999999", #grey
+               "#E69F00", #orange
+               "#56B4E9", #sky blue
+               "#009E73", #bluish green 
+               "#F0E442", #yellow
+               "#0072B2", #blue
+               "#D55E00", #vermillion
+               "#CC79A7") #reddish purple
+```
+
+## Matrices
+Most network data can be represented as a matrix. Take for example the following data pertaining to expression of Vibrio cholerae virulence genes across 300 samples. Say we want to visualize correlation between genes/across samples. We will start wit raw data with normalized reads per transcript across experiments
+```{r load_in_data}
+# Raw data with normalized reads per transcript across experiments
+virulence_tbl <- read_csv("data/VPI1_VPI2.csv") %>%
+  filter(!(Transcript%in%c(paste0("VC",c(1785:1900)))))
+head(virulence_tbl)
+```
+
+Next we need to convert this into a matrix with only numbers
+```{r data_2_matrix}
+
+vir_matrix <- as.matrix(virulence_tbl %>% column_to_rownames("Transcript"))
+vir_matrix[1:10,1:10]
+```
+
+Our correlation function, cor(), calculates correlations between columns so we need to rotate our data using the t() (transpose) function.
+```{r rotate_matrix}
+vir_matrix <- t(vir_matrix)
+vir_matrix[1:10,1:10]
+```
+
+Now we run cor and figure out and get a beautiful correlation matrix
+```{r calc_corr_mat}
+corr_matrix <- cor(vir_matrix)
+corr_matrix[1:10,1:10]
+```
+
+After converting this matrix into a tidy format we can visualize our results in a heatmap using geom_tile
+```{r plot_heatmap_correlation}
+long_tbl <- corr_matrix %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column(var = "Transcript1") %>%
+  pivot_longer(cols = -Transcript1, names_to = "Transcript2",
+               values_to = "Correlation") %>%
+  mutate(Transcript1 = as.character(Transcript1))
+ggplot(long_tbl, aes(x = Transcript1,
+                     y = Transcript2,
+                     fill = Correlation)) +
+  
+  geom_tile() +
+  scale_x_discrete(breaks = c(virulence_tbl$Transcript))+
+  scale_fill_gradient2(low = "red",
+                       high = "blue",
+                       limits = c(-1,1)) +
+  theme(axis.text.x = element_text(angle = 45,
+                                   hjust = 1))
+
+```
+
+Man is this busy/ugly! This data would look much better if we could somehow filter to show only interesting connections and avoid redundant info. How do we do that?
+
+## Tidygraph and ggraph basics 
+We can make a network using tidygraph and ggraph! 
+Tidygraph is an extension of existing table manipulation tidyverse packages (e.g. tidyr, dplyr) that can represent network/graph type data. 
+Ggraph extends ggplot's grammar/syntax style to visualizing network/graph data.
+
+Let's start by converting our previous correlation matrix into a tbl_graph object
+```{r matrix_2_tdygraph}
+vir_graph <- as_tbl_graph(corr_matrix)
+vir_graph
+
+```
+
+As you can see, our tbl_graph is really just two tibbles now, one containing all of our node information and the other containing all the edge data. You can manipulate these tibbles using standard tidyverse functions (e.g. left_join, mutate, filter, select). We will give some examples shortly but let's first see what this data looks like when we plot it using ggraph. Ggraph is based off of the syntax of ggplot and every network plot will require a ggraph call to specify data you want to graph as well as calls to a node and edge geom.
+```{r ggraph_test}
+ggraph(vir_graph) + # ggraph call
+  geom_node_point() + # node geom
+  geom_edge_link() # edge geom
+
+```
+
+That took a while and is exceptionally ugly! Let's apply a correlation cutoff. We're only interested in genes with a correlation of > 0.5 or < -0.1 so let's filter and replot that. To specify which tibble we want to filter on (either edges or nodes) we use the activate function
+```{r filter_edges}
+vir_graph_filtered <- vir_graph %>%
+  activate(edges) %>%
+  filter(weight >= 0.5 | weight < -0.1)
+
+ggraph(vir_graph_filtered) +
+  geom_node_point() +
+  geom_edge_link()
+
+```
+
+Looking better, now let's tweak things a bit so that we know what genes we're using and the edges aren't so overwhelming. Most ggraph geoms are analogous to existing ggplot geoms and take similar parameters. Here, we use an alpha value to control how transparent the edges are and use geom_node_text to label our nodes.
+```{r graph_filtered2}
+ggraph(vir_graph_filtered) +
+  geom_edge_link(alpha = 0.1) +
+  geom_node_point() +
+  geom_node_text(aes(label = name)) # Note that you can use the repel=TRUE option force labels to avoid overlapping
+
+```
+
+## Into the weeds {.tabset}
+### Coloring edges and nodes
+We just went over the basics for tidygraph and ggraph, now let's dig into the weeds a bit. Here we want to add some color to our graph so that we can quickly figure out some info about our nodes and edges. Let's color nodes by location on the genome (VPI1, VPI2, or other) and color edges by the correlation between genes
+```{r add_node_colours}
+vpi2 <- paste0("VC", c(1757:1810))
+vpi1 <- paste0("VC0", c(817:847))
+
+vir_graph_groups <- 
+  vir_graph_filtered %>%
+  activate(nodes) %>%
+  mutate(group = 
+           case_when(name %in% vpi1 ~ "VPI1",
+                     name %in% vpi2 ~ "VPI2",
+                     TRUE ~ "Other"))
+  
+
+ggraph(vir_graph_groups) +
+  geom_edge_link(alpha = 0.25, aes(colour = weight)) +
+  scale_edge_color_gradient2(low = "red",
+                             mid = "grey50",
+                       high = "blue",
+                       limits = c(-1,1)) + 
+  geom_node_point(aes(colour = group)) +
+  scale_colour_manual(values = cbPalette)
+
+```
+
+The edge colors were a little faint and the nodes are a little small. call we improve this? Let's use binary coloring for the edges (positive/negative instead of the numerical gradient) and increase the size of the nodes.
+```{r better_edge_colours}
+
+vir_graph_colours <- 
+  vir_graph_groups %>%
+  activate(edges) %>%
+  mutate(corr_dir= if_else(weight > 0, 
+                             "positive",
+                             "negative"))
+ggraph(vir_graph_colours) +
+  geom_edge_link(alpha = 0.1, aes(colour = corr_dir)) +
+  scale_edge_color_manual(values = c("positive" = "blue",
+                                     "negative" = "red"))+
+  geom_node_point(aes(colour = group), size = 4) +
+  scale_colour_manual(values = cbPalette)
+
+```
+
+### Labels and shapes
+Now let's label all of the genes in the "Other" group and change the shape of the nodes based on their grouping.
+```{r shapes_and_labels}
+vir_graph_shapes_labels <- 
+  vir_graph_colours %>%
+  activate(nodes) %>%
+  mutate(name_label = if_else(group == "Other",
+                              name,
+                              NA_character_))
+ggraph(vir_graph_shapes_labels) +
+  geom_edge_link(alpha = 0.1, aes(colour = corr_dir)) +
+  scale_edge_color_manual(values = c("positive" = "blue",
+                                     "negative" = "red"))+
+  geom_node_point(aes(colour = group,
+                      shape = group), size = 4) +
+  scale_colour_manual(values = cbPalette) +
+  geom_node_text(aes(label = name_label))
+
+```
+
+
+### Facetting
+You can also facet based on nodes or edges. This can be great if you want to show how the same network changes over time/different conditions.
+
+#### Node facetting
+```{r facet_nodes}
+ggraph(vir_graph_shapes_labels) +
+  geom_edge_link(alpha = 0.1, aes(colour = corr_dir)) +
+  scale_edge_color_manual(values = c("positive" = "blue",
+                                     "negative" = "red"))+
+  geom_node_point(aes(colour = group,
+                      shape = group), size = 4) +
+  scale_colour_manual(values = cbPalette) +
+  geom_node_text(aes(label = name_label)) +
+  facet_nodes(~group)
+
+```
+
+
+#### Edge facetting
+```{r facet_edges}
+ggraph(vir_graph_shapes_labels) +
+  geom_edge_link(alpha = 0.1, aes(colour = corr_dir)) +
+  scale_edge_color_manual(values = c("positive" = "blue",
+                                     "negative" = "red"))+
+  geom_node_point(aes(colour = group,
+                      shape = group), size = 4) +
+  scale_colour_manual(values = cbPalette) +
+  geom_node_text(aes(label = name_label)) +
+  facet_edges(~corr_dir)
+
+```
+
+### Network analysis
+You may want to characterize certain aspects of your network such as node centrality (i.e. connectedness) or cluster your nodes based on an established algorithm/network topology. Tidygraph is loaded with a ton of convenient functions to do just that! Let's run through a quick example that calculates the centrality of our nodes and clusters them.
+
+```{r}
+
+vir_graph_cent_clust <- 
+  vir_graph_shapes_labels %>%
+  activate(nodes) %>%
+  mutate(
+    central = centrality_closeness(),
+    infomap = as.factor(group_infomap()))
+
+ggraph(vir_graph_cent_clust) +
+  geom_edge_link(alpha = 0.1, aes(colour = corr_dir)) +
+  scale_edge_color_manual(values = c("positive" = "blue",
+                                     "negative" = "red"))+
+  geom_node_point(aes(colour = infomap,
+                      shape = group,
+                      size = central)) +
+  scale_colour_manual(values = cbPalette) +
+  geom_node_text(aes(label = name_label))
+
+```
+
+### Normal Layouts
+You can manually choose any layout supported by igraph (see here for some ideas: https://www.data-imaginist.com/2017/ggraph-introduction-layouts/). These can drastically change the appearance of your final plot. Here's an example of the sample data visualized with 12 different layouts ("stress" is the default we've been using thus far).
+```{r function, fig.height=16, fig.width = 12}
+
+layout_test <- 
+  function(layout_choice,
+           graph_in){
+  plot_out <- ggraph(graph_in, layout = layout_choice) +
+  geom_edge_link(alpha = 0.1, aes(colour = corr_dir)) +
+  scale_edge_color_manual(values = c("positive" = "blue",
+                                     "negative" = "red"))+
+  geom_node_point(aes(colour = group,
+                      shape = group), size = 4) +
+  scale_colour_manual(values = cbPalette) +
+  ggtitle(layout_choice) +
+  geom_node_text(aes(label = name_label))
+  
+  return(plot_out)
+
+  }
+
+layouts <- c('star', 'circle', 'gem', 'dh', 'graphopt', 'grid', 'mds', 
+                    'randomly', 'fr', 'drl', 'lgl', 'stress')
+
+vir_graph_simple <- vir_graph_shapes_labels %>%
+  activate(nodes) %>%
+  filter(group != "VPI2")
+
+plot_list <- lapply(layouts,
+                    layout_test,
+                    graph_in = vir_graph_simple)
+
+plot_grid(plotlist = plot_list,
+          ncol = 3)
+
+```
+
+### Special Layouts
+You may also want to employ some more specialized layouts in combination with specific node or edge geoms. Ggraph provides a lot of functionality including:
+
+#### Linear
+```{r linear}
+ggraph(vir_graph_shapes_labels, layout = "linear") +
+  geom_edge_arc(alpha = 0.1, aes(colour = corr_dir)) +
+  scale_edge_color_manual(values = c("positive" = "blue",
+                                     "negative" = "red"))+
+  geom_node_point(aes(colour = group,
+                      shape = group), size = 4) +
+  scale_colour_manual(values = cbPalette)
+
+```
+
+#### Circular
+```{r circular}
+ggraph(vir_graph_shapes_labels, layout = "linear", circular = TRUE) +
+  geom_edge_arc(alpha = 0.1, aes(colour = corr_dir)) +
+  scale_edge_color_manual(values = c("positive" = "blue",
+                                     "negative" = "red"))+
+  geom_node_point(aes(colour = group,
+                      shape = group), size = 4) +
+  scale_colour_manual(values = cbPalette)
+
+```
+
+#### Dendrogram/tree
+This is just a fun example, there are much better packages to make these with, e.g. ggtree.
+```{r}
+vir_dist <- as.dist(corr_matrix)
+vir_clust <- hclust(vir_dist)
+
+clust_graph <- as_tbl_graph(vir_clust) %>%
+  activate(nodes) %>%
+  mutate(group = 
+           case_when(label %in% vpi1 ~ "VPI1",
+                     label %in% vpi2 ~ "VPI2",
+                     label == "" ~ NA_character_,
+                     TRUE ~ "Other"))
+ggraph(clust_graph, layout = "dendrogram") +
+  geom_edge_diagonal2(aes(colour = node.group)) +
+  # geom_node_point(, size = 3) +
+  geom_node_text(aes(label = label), angle = 45, nudge_y = -0.4, nudge_x = -0.6)
+```
+
+## More to consider
+We've covered the basics but there are a lot of edge (and node!) cases that could come up. Here are some links and tips that may be helpful as you work on your own network visualizations:
+
+- Both tidygraph and ggraph take advantage of igraph code (the tbl_graph is an igraph object!). For more on igraph and some other visualization options in R, check these excellent guides: https://kateto.net/network-visualization and https://www.jessesadler.com/post/network-analysis-with-r/
+- Cytoscape (https://cytoscape.org/) is a great open source network visualization software suite. It can be much faster to do data exploration in Cytoscape than R and you can always transfer networks between the two (https://www.bioconductor.org/packages/release/bioc/vignettes/RCy3/inst/doc/Cytoscape-and-iGraph.html).
+- For general data visualization tips I'd recommend my advisor's book, https://clauswilke.com/dataviz/.
+- Google will always be your friend!
